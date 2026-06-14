@@ -1,0 +1,139 @@
+/**
+ * 任务栏歌词插件 - 浮窗样式
+ * 透明背景，歌词在任何桌面上都清晰可见
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* 完全透明背景 */
+  background: transparent !important;
+  user-select: none;
+}
+
+/* 淡入动画：初始透明，挂载后由 JS 添加 .tb-lyric-visible */
+html {
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+html.tb-lyric-visible {
+  opacity: 1;
+}
+
+/* 根容器：flex 布局，居中对齐 */
+.tb-lyric-root {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  padding: 4px 16px;
+  /* 透明背景 */
+  background: transparent;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* 有封面时调整左侧内边距 */
+.tb-lyric-root.has-cover {
+  padding: 4px 16px 4px 8px;
+}
+
+/* 封面容器 */
+.tb-lyric-cover {
+  flex-shrink: 0;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 圆形封面 */
+.tb-lyric-cover.round {
+  border-radius: 50%;
+}
+
+/* 方形封面（带圆角） */
+.tb-lyric-cover.square {
+  border-radius: 6px;
+}
+
+/* 封面图片 */
+.tb-lyric-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 歌词文本容器 */
+.tb-lyric-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+/* 歌词行容器 — overflow hidden 用于裁剪，滚动由内部 .tb-lyric-scroll 驱动 */
+.tb-lyric-primary,
+.tb-lyric-secondary {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* 歌词滚动内包装 — inline-block 保证自身可测宽 */
+.tb-lyric-scroll {
+  display: inline-block;
+  white-space: nowrap;
+  will-change: transform;
+}
+
+/* 溢出时启动滚动动画 */
+.tb-lyric-primary.tb-lyric-overflow > .tb-lyric-scroll,
+.tb-lyric-secondary.tb-lyric-overflow > .tb-lyric-scroll {
+  animation: tb-lyric-marquee var(--marquee-dur, 6s) linear infinite;
+}
+
+@keyframes tb-lyric-marquee {
+  0%, 18% {
+    transform: translateX(0);
+  }
+  82%, 100% {
+    transform: translateX(var(--scroll-offset, -50px));
+  }
+}
+
+/* 主歌词样式 */
+.tb-lyric-primary {
+  font-weight: 600;
+  line-height: 1.3;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+/* 副歌词样式 */
+.tb-lyric-secondary {
+  font-weight: 400;
+  line-height: 1.3;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/**
+ * 卡拉OK 效果的歌词字符
+ */
+.tb-lyric-char {
+  display: inline;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  will-change: background-position;
+}
