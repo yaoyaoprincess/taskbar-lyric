@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS = {
   manualAdjust: false,
   showTranslation: true,
   showRomanization: false,
+  secondaryScroll: false,
   emptyText: "EchoMusic",
 };
 
@@ -205,6 +206,22 @@ const getLineStartMs = (line) => {
   return Math.round((Number(line?.time) || 0) * 1000);
 };
 
+/** 获取歌词行演唱时长(秒) — 跑马灯用演唱时长封顶,确保滚动在唱完前完成 */
+const getLineDurationSec = (line, lineIndex, allLines) => {
+  if (!line) return 10;
+  const lineStart = getLineStartMs(line);
+  const chars = line.characters || [];
+  let lineEnd;
+  if (chars.length > 0) {
+    lineEnd = chars[chars.length - 1]?.endTime ?? 0;
+  }
+  if (!lineEnd) {
+    const nextIdx = lineIndex + 1;
+    lineEnd = nextIdx < allLines.length ? getLineStartMs(allLines[nextIdx]) : lineStart + 5000;
+  }
+  return Math.max((lineEnd - lineStart) / 1000, 0.5);
+};
+
 const calculateLineIndex = (lines, seekMs) => {
   if (!Array.isArray(lines) || lines.length === 0) return -1;
   let index = -1;
@@ -336,8 +353,10 @@ export function activateWindow(ctx) {
 
       /** 检测歌词溢出并更新 CSS 变量驱动 marquee 动画
        *  ⚠️ .tb-lyric-scroll 是 inline-block 无宽度约束,自身 clientWidth 永远==scrollWidth
-       *     溢出检测必须用父容器(.tb-lyric-primary)的 clientWidth 来做判断 */
+       *     溢出检测必须用父容器(.tb-lyric-primary)的 clientWidth 来做判断
+       *  跑马灯时长用演唱时长封顶(85%),确保唱完前滚动到位 */
       const checkOverflow = () => {
+        const allLines = snapshot.value?.lyric?.lines ?? [];
         // 主歌词
         if (primaryScrollEl) {
           const container = primaryScrollEl.parentElement;
@@ -345,19 +364,27 @@ export function activateWindow(ctx) {
           primaryOverflow.value = overflow;
           if (overflow) {
             const px = primaryScrollEl.scrollWidth - container.clientWidth;
-            const dur = clamp(px / 30, 4, 10);
+            const baseDur = clamp(px / 30, 4, 10);
+            const lineDur = getLineDurationSec(currentLine.value, currentIndex.value, allLines);
+            const dur = clamp(Math.min(lineDur * 0.85, baseDur), 3, 10);
             container.style.setProperty('--scroll-offset', `-${px}px`);
             container.style.setProperty('--marquee-dur', `${dur}s`);
           }
         }
-        // 副歌词
-        if (secondaryScrollEl) {
+        // 副歌词（仅在设置中开启时才启用跑马灯）
+        if (secondaryScrollEl && settings.secondaryScroll) {
           const container = secondaryScrollEl.parentElement;
           const overflow = secondaryScrollEl.scrollWidth > container.clientWidth + 1;
           secondaryOverflow.value = overflow;
           if (overflow) {
             const px = secondaryScrollEl.scrollWidth - container.clientWidth;
-            const dur = clamp(px / 30, 4, 10);
+            const baseDur = clamp(px / 30, 4, 10);
+            // 翻译/音译→当前行时长; 下一行预览→下一行时长
+            const info = secondaryInfo.value;
+            const lineForDur = (info?.type === "nextLine") ? nextLine.value : currentLine.value;
+            const lineIdx = (info?.type === "nextLine") ? currentIndex.value + 1 : currentIndex.value;
+            const lineDur = getLineDurationSec(lineForDur, lineIdx, allLines);
+            const dur = clamp(Math.min(lineDur * 0.85, baseDur), 3, 10);
             container.style.setProperty('--scroll-offset', `-${px}px`);
             container.style.setProperty('--marquee-dur', `${dur}s`);
           }
