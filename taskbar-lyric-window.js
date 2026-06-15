@@ -43,6 +43,8 @@ const DEFAULT_SETTINGS = {
   showTranslation: true,
   showRomanization: false,
   secondaryScroll: false,
+  lyricFilterEnabled: false,
+  lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
   emptyText: "EchoMusic",
 };
 
@@ -206,20 +208,26 @@ const getLineStartMs = (line) => {
   return Math.round((Number(line?.time) || 0) * 1000);
 };
 
-/** 获取歌词行演唱时长(秒) — 跑马灯用演唱时长封顶,确保滚动在唱完前完成 */
-const getLineDurationSec = (line, lineIndex, allLines) => {
-  if (!line) return 10;
+/** 计算当前行播放进度(0–1),用于驱动滚动位置
+ *  @param line      歌词行对象
+ *  @param lineIndex 行索引
+ *  @param allLines  全部歌词行
+ *  @param seekMs    当前播放位置(毫秒)
+ *  @returns {number} 0–1 之间的进度值 */
+const getLineProgress = (line, lineIndex, allLines, seekMs) => {
+  if (!line || !allLines?.length) return 0;
   const lineStart = getLineStartMs(line);
   const chars = line.characters || [];
   let lineEnd;
   if (chars.length > 0) {
     lineEnd = chars[chars.length - 1]?.endTime ?? 0;
   }
-  if (!lineEnd) {
+  if (!lineEnd || lineEnd <= lineStart) {
     const nextIdx = lineIndex + 1;
     lineEnd = nextIdx < allLines.length ? getLineStartMs(allLines[nextIdx]) : lineStart + 5000;
   }
-  return Math.max((lineEnd - lineStart) / 1000, 0.5);
+  const duration = Math.max(lineEnd - lineStart, 1);
+  return Math.max(0, Math.min(1, (seekMs - lineStart) / duration));
 };
 
 const calculateLineIndex = (lines, seekMs) => {
@@ -237,6 +245,28 @@ const calculateLineIndex = (lines, seekMs) => {
     }
   }
   return index;
+};
+
+/** 从指定索引起查找第一个未被过滤的可见行索引
+ *  供 tickLyric 和 nextLine 使用，在过滤启用时跳过匹配正则的行
+ *  @returns {number} 原始行索引（若全部匹配则返回最后一行降级显示） */
+const findNextVisibleIndex = (fromIndex, lines, settings) => {
+  if (!settings.lyricFilterEnabled || !settings.lyricFilterPatterns?.trim()) return fromIndex;
+  if (fromIndex < 0 || !lines || fromIndex >= lines.length) return fromIndex;
+  try {
+    const regex = new RegExp(settings.lyricFilterPatterns, 'i');
+    let i = fromIndex;
+    while (i < lines.length) {
+      const text = String(lines[i]?.text || "").trim();
+      if (!regex.test(text)) return i;
+      i++;
+    }
+    // 全部后续行均匹配，返回最后一行降级显示
+    return lines.length - 1;
+  } catch {
+    // 正则无效时不做过滤
+    return fromIndex;
+  }
 };
 
 /**
@@ -314,7 +344,11 @@ export function activateWindow(ctx) {
         const lines = snap.lyric?.lines ?? [];
         const seekMs = getLyricSeekMs(snap) + LYRIC_LOOKAHEAD_MS;
         const idx = calculateLineIndex(lines, seekMs);
-        currentIndex.value = idx >= 0 ? idx : (snap.lyric?.currentIndex ?? -1);
+        const rawIndex = idx >= 0 ? idx : (snap.lyric?.currentIndex ?? -1);
+        // 应用正则过滤，跳过匹配的歌词行（制作信息、版权信息等）
+        currentIndex.value = findNextVisibleIndex(rawIndex, lines, settings);
+        // 每帧驱动滚动位置,取代 CSS animation
+        updateScrollPosition();
       };
 
       // 当前歌词行
@@ -323,10 +357,13 @@ export function activateWindow(ctx) {
         return lines[currentIndex.value] ?? null;
       });
 
-      // 下一行歌词(用于双行模式副文本)
+      // 下一行歌词(用于双行模式副文本，过滤时跳过被忽略的行)
       const nextLine = computed(() => {
         const lines = snapshot.value?.lyric?.lines ?? [];
-        return lines[currentIndex.value + 1] ?? null;
+        const startIdx = currentIndex.value + 1;
+        if (startIdx >= lines.length) return null;
+        const visibleIdx = findNextVisibleIndex(startIdx, lines, settings);
+        return lines[visibleIdx] ?? null;
       });
 
       // 主歌词文本
@@ -347,46 +384,79 @@ export function activateWindow(ctx) {
       /** 溢出状态标记 */
       const primaryOverflow = ref(false);
       const secondaryOverflow = ref(false);
+      /** 溢出像素量,由 checkOverflow 计算,供进度驱动滚动使用 */
+      const primaryOverflowPx = ref(0);
+      const secondaryOverflowPx = ref(0);
       /** 滚动元素 DOM 引用(回调 ref) */
       let primaryScrollEl = null;
       let secondaryScrollEl = null;
 
-      /** 检测歌词溢出并更新 CSS 变量驱动 marquee 动画
+      /** 检测歌词溢出,存储溢出像素量供进度驱动滚动使用
        *  ⚠️ .tb-lyric-scroll 是 inline-block 无宽度约束,自身 clientWidth 永远==scrollWidth
-       *     溢出检测必须用父容器(.tb-lyric-primary)的 clientWidth 来做判断
-       *  跑马灯时长用演唱时长封顶(85%),确保唱完前滚动到位 */
+       *     溢出检测必须用父容器(.tb-lyric-primary)的 clientWidth 来做判断 */
       const checkOverflow = () => {
-        const allLines = snapshot.value?.lyric?.lines ?? [];
         // 主歌词
         if (primaryScrollEl) {
           const container = primaryScrollEl.parentElement;
           const overflow = primaryScrollEl.scrollWidth > container.clientWidth + 1;
           primaryOverflow.value = overflow;
           if (overflow) {
-            const px = primaryScrollEl.scrollWidth - container.clientWidth;
-            const baseDur = clamp(px / 30, 4, 10);
-            const lineDur = getLineDurationSec(currentLine.value, currentIndex.value, allLines);
-            const dur = clamp(Math.min(lineDur * 0.85, baseDur), 3, 10);
-            container.style.setProperty('--scroll-offset', `-${px}px`);
-            container.style.setProperty('--marquee-dur', `${dur}s`);
+            primaryOverflowPx.value = primaryScrollEl.scrollWidth - container.clientWidth;
           }
         }
-        // 副歌词（仅在设置中开启时才启用跑马灯）
-        if (secondaryScrollEl && settings.secondaryScroll) {
+        // 副歌词（始终检测溢出，翻译/音译自动跟随主歌词滚动，下一行预览由 secondaryScroll 控制）
+        if (secondaryScrollEl) {
           const container = secondaryScrollEl.parentElement;
           const overflow = secondaryScrollEl.scrollWidth > container.clientWidth + 1;
           secondaryOverflow.value = overflow;
           if (overflow) {
-            const px = secondaryScrollEl.scrollWidth - container.clientWidth;
-            const baseDur = clamp(px / 30, 4, 10);
-            // 翻译/音译→当前行时长; 下一行预览→下一行时长
+            secondaryOverflowPx.value = secondaryScrollEl.scrollWidth - container.clientWidth;
+          }
+        }
+        // 溢出量更新后立即修正滚动位置
+        updateScrollPosition();
+      };
+
+      /** 按播放进度驱动歌词滚动位置
+       *  取代 CSS animation 方案,解决两个 bug:
+       *  1. 长歌词已播到后半段,滚动却从最前重新开始
+       *  2. 两个长句衔接时,第二句先展示末尾再跳回开头
+       *  原理: translateX = -overflowPx × progress,每 33ms 更新 */
+      const updateScrollPosition = () => {
+        const snap = snapshot.value;
+        if (!snap) return;
+        const allLines = snap.lyric?.lines ?? [];
+        const seekMs = getLyricSeekMs(snap);
+
+        // 主歌词进度驱动滚动
+        if (primaryScrollEl) {
+          if (primaryOverflow.value && primaryOverflowPx.value > 0) {
+            const progress = getLineProgress(currentLine.value, currentIndex.value, allLines, seekMs);
+            primaryScrollEl.style.transform = `translateX(${-primaryOverflowPx.value * progress}px)`;
+          } else {
+            primaryScrollEl.style.transform = '';
+          }
+        }
+
+        // 副歌词进度驱动滚动
+        // 翻译/音译 → 始终跟随主歌词同步滚动（不受 secondaryScroll 开关控制）
+        // 下一行预览 → 需用户开启 secondaryScroll 才滚动
+        if (secondaryScrollEl) {
+          if (secondaryOverflow.value && secondaryOverflowPx.value > 0) {
             const info = secondaryInfo.value;
-            const lineForDur = (info?.type === "nextLine") ? nextLine.value : currentLine.value;
-            const lineIdx = (info?.type === "nextLine") ? currentIndex.value + 1 : currentIndex.value;
-            const lineDur = getLineDurationSec(lineForDur, lineIdx, allLines);
-            const dur = clamp(Math.min(lineDur * 0.85, baseDur), 3, 10);
-            container.style.setProperty('--scroll-offset', `-${px}px`);
-            container.style.setProperty('--marquee-dur', `${dur}s`);
+            const isTranslation = info?.type === "translation" || info?.type === "romanization";
+            const shouldScroll = isTranslation || settings.secondaryScroll;
+            if (shouldScroll) {
+              // 翻译/音译与主歌词使用同一进度，视觉上同步滚动
+              const lineForProgress = isTranslation ? currentLine.value : nextLine.value;
+              const lineIdx = isTranslation ? currentIndex.value : currentIndex.value + 1;
+              const progress = getLineProgress(lineForProgress, lineIdx, allLines, seekMs);
+              secondaryScrollEl.style.transform = `translateX(${-secondaryOverflowPx.value * progress}px)`;
+            } else {
+              secondaryScrollEl.style.transform = '';
+            }
+          } else {
+            secondaryScrollEl.style.transform = '';
           }
         }
       };
@@ -395,6 +465,92 @@ export function activateWindow(ctx) {
       const coverUrl = computed(() =>
         snapshot.value?.playback?.cover || snapshot.value?.playback?.coverUrl || "",
       );
+
+      // ==================== 悬停控件 ====================
+
+      /** 悬停状态:鼠标移入时显示控件、淡出歌词;移出后恢复 */
+      const isHovered = ref(false);
+      let leaveDebounce = null;
+
+      const onMouseEnter = () => {
+        if (leaveDebounce) { clearTimeout(leaveDebounce); leaveDebounce = null; }
+        if (!isHovered.value) {
+          isHovered.value = true;
+          // 切换到全交互模式,允许点击控件按钮
+          ctx.window.setIgnoreMouseEvents(false);
+        }
+      };
+
+      const onMouseLeave = () => {
+        // 300ms 防抖,避免快速扫过时闪烁
+        leaveDebounce = setTimeout(() => {
+          isHovered.value = false;
+          // 恢复穿透模式
+          if (settings.lockPosition) {
+            ctx.window.setIgnoreMouseEvents(true, { forward: true });
+          } else {
+            ctx.window.setIgnoreMouseEvents(false);
+          }
+        }, 300);
+      };
+
+      /** 切换锁定状态(控件栏锁按钮) */
+      const toggleLock = async () => {
+        const nextLock = !settings.lockPosition;
+        settings.lockPosition = nextLock;
+        if (nextLock) {
+          ctx.window.setIgnoreMouseEvents(true, { forward: true });
+          document.body.style.setProperty('-webkit-app-region', 'no-drag');
+          await captureOffsetsFromPosition();
+        } else {
+          ctx.window.setIgnoreMouseEvents(false);
+          document.body.style.setProperty('-webkit-app-region', 'drag');
+        }
+        // 持久化
+        try {
+          const saved = await ctx.storage.get("settings");
+          await ctx.storage.set("settings", { ...(saved || {}), lockPosition: nextLock });
+        } catch { /* 静默忽略 */ }
+      };
+
+      // ==================== SVG 矢量图标 ====================
+
+      /** 锁图标 — Feather Icons 风格描边 SVG */
+      const lockIcon = (open) => h("svg", {
+        width: 16, height: 16, viewBox: "0 0 24 24",
+        fill: "none", stroke: "currentColor",
+        "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round",
+      }, [
+        h("rect", { x: 5, y: 11, width: 14, height: 10, rx: 2 }),
+        h("path", {
+          d: open
+            ? "M8 11V7a4 4 0 0 1 7.8-1"
+            : "M8 11V7a4 4 0 0 1 8 0v4",
+        }),
+      ]);
+
+      /** 喜欢图标 — 实心/空心心形 SVG，喜欢时显示红色 */
+      const heartIcon = (liked) => h("svg", {
+        width: 16, height: 16, viewBox: "0 0 24 24",
+        fill: liked ? "#ff2d55" : "none",
+        stroke: liked ? "#ff2d55" : "currentColor",
+        "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round",
+      }, [
+        h("path", {
+          d: "M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z",
+        }),
+      ]);
+
+      // ==================== 喜欢状态（来源：snapshot） ====================
+
+      /** 喜欢状态直接从播放快照读取
+       *  EchoMusic >= 2.2.6 起 snapshot.playback.isFavorite 由主进程维护 */
+      const isLiked = computed(() => snapshot.value?.playback?.isFavorite ?? false);
+
+      /** 收藏切换（控件按钮调用）*/
+      const toggleFavorite = () => {
+        ctx.nowPlaying.command('toggleFavorite').catch(() => {});
+      };
 
       /**
        * 渲染卡拉OK 效果的歌词文本
@@ -535,9 +691,14 @@ export function activateWindow(ctx) {
           try { ctx.window.setAlwaysOnTop(true); } catch {}
         }, 3000);
 
-        // 9. 根据锁定状态设置鼠标穿透与拖拽(默认锁定 = 穿透 + 不可拖拽)
-        ctx.window.setIgnoreMouseEvents(Boolean(settings.lockPosition));
-        document.body.style.setProperty('-webkit-app-region', settings.lockPosition ? 'no-drag' : 'drag');
+        // 9. 根据锁定状态设置鼠标穿透与拖拽(默认锁定 = 透传 mousemove 用于检测悬停)
+        if (settings.lockPosition) {
+          ctx.window.setIgnoreMouseEvents(true, { forward: true });
+          document.body.style.setProperty('-webkit-app-region', 'no-drag');
+        } else {
+          ctx.window.setIgnoreMouseEvents(false);
+          document.body.style.setProperty('-webkit-app-region', 'drag');
+        }
 
         // 10. 淡入显示窗口
         requestAnimationFrame(() => {
@@ -579,6 +740,7 @@ export function activateWindow(ctx) {
         stopWatchPosition?.();
         stopWatchLock?.();
         stopWatchOverflow?.();
+
         snapshotDispose?.();
         if (clockTimer) clearInterval(clockTimer);
         if (settingsSyncTimer) clearInterval(settingsSyncTimer);
@@ -597,13 +759,18 @@ export function activateWindow(ctx) {
         },
       );
 
-      // 监听锁定状态变化(仅切换鼠标穿透 + 拖拽区域,不重算位置)
-      // 锁定时自动捕获拖拽后的当前位置并反算偏移值持久化
+      // 监听锁定状态变化
+      // 锁定时用 { forward: true } 保持 mousemove 接收,供悬停检测使用
       const stopWatchLock = watch(
         () => settings.lockPosition,
         (lock) => {
-          ctx.window.setIgnoreMouseEvents(Boolean(lock));
-          document.body.style.setProperty('-webkit-app-region', lock ? 'no-drag' : 'drag');
+          if (lock) {
+            ctx.window.setIgnoreMouseEvents(true, { forward: true });
+            document.body.style.setProperty('-webkit-app-region', 'no-drag');
+          } else {
+            ctx.window.setIgnoreMouseEvents(false);
+            document.body.style.setProperty('-webkit-app-region', 'drag');
+          }
           if (lock) {
             captureOffsetsFromPosition();
           }
@@ -625,8 +792,11 @@ export function activateWindow(ctx) {
         const showCover = settings.showCover && coverUrl.value;
         const coverOnLeft = settings.coverPosition === "left";
         const fontFamilyStyle = settings.fontFamily || undefined;
-        const seekMs = getLyricSeekMs(snapshot.value || {});
+        const snap = snapshot.value;
+        const seekMs = getLyricSeekMs(snap || {});
         const textAlign = coverOnLeft ? "left" : "right";
+        const isPlaying = snap?.playback?.isPlaying;
+        const liked = isLiked.value;
 
         const primaryStyle = {
           fontSize: `${settings.lyricFontSize}px`,
@@ -684,12 +854,43 @@ export function activateWindow(ctx) {
             : null,
         ]);
 
+        // 悬停控件栏
+        const controlsElement = h("div", { class: "tb-lyric-controls" }, [
+          h("button", {
+            class: "tb-lyric-btn",
+            title: "上一首",
+            onClick: (e) => { e.stopPropagation(); ctx.nowPlaying.command("previousTrack").catch(() => {}); },
+          }, "\u23EE"),
+          h("button", {
+            class: ["tb-lyric-btn", "tb-lyric-btn-play"],
+            title: isPlaying ? "暂停" : "播放",
+            onClick: (e) => { e.stopPropagation(); ctx.nowPlaying.command("togglePlayback").catch(() => {}); },
+          }, isPlaying ? "\u23F8" : "\u25B6"),
+          h("button", {
+            class: "tb-lyric-btn",
+            title: "下一首",
+            onClick: (e) => { e.stopPropagation(); ctx.nowPlaying.command("nextTrack").catch(() => {}); },
+          }, "\u23ED"),
+          h("button", {
+            class: ["tb-lyric-btn", "tb-lyric-btn-icon"],
+            title: liked ? "取消喜欢" : "喜欢",
+            onClick: (e) => { e.stopPropagation(); toggleFavorite(); },
+          }, heartIcon(liked)),
+          h("button", {
+            class: ["tb-lyric-btn", "tb-lyric-btn-icon"],
+            title: settings.lockPosition ? "解锁" : "锁定",
+            onClick: (e) => { e.stopPropagation(); toggleLock(); },
+          }, lockIcon(!settings.lockPosition)),
+        ]);
+
         const children = coverOnLeft
-          ? [coverElement, textElement]
-          : [textElement, coverElement];
+          ? [coverElement, textElement, controlsElement]
+          : [textElement, coverElement, controlsElement];
 
         return h("div", {
-          class: ["tb-lyric-root", showCover ? "has-cover" : ""],
+          class: ["tb-lyric-root", showCover ? "has-cover" : "", isHovered.value ? "tb-lyric-hover" : ""],
+          onMouseenter: onMouseEnter,
+          onMouseleave: onMouseLeave,
         }, children);
       };
     },

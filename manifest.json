@@ -1,7 +1,7 @@
 {
   "id": "taskbar-lyric",
   "name": "任务栏歌词",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "在任务栏上方显示当前歌词和专辑封面的透明浮窗，自动检测任务栏位置并贴靠。",
   "author": "yaoyaoprincess",
   "icon": "icon.svg",
@@ -10,7 +10,7 @@
     "localFiles": true
   },
   "requires": {
-    "echoMusicVersion": ">=2.2.6-beta.9"
+    "echoMusicVersion": ">=2.2.7-beta.1"
   },
   "contributes": {
     "windows": [
@@ -24,7 +24,7 @@
         "defaultHeight": 40,
         "minWidth": 200,
         "minHeight": 24,
-        "maxWidth": 1200,
+        "maxWidth": 600,
         "maxHeight": 80,
         "transparent": true,
         "alwaysOnTop": true,

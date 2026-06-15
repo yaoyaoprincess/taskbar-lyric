@@ -30,6 +30,7 @@ html.tb-lyric-visible {
 
 /* 根容器：flex 布局，居中对齐 */
 .tb-lyric-root {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -96,20 +97,8 @@ html.tb-lyric-visible {
   will-change: transform;
 }
 
-/* 溢出时启动滚动动画 */
-.tb-lyric-primary.tb-lyric-overflow > .tb-lyric-scroll,
-.tb-lyric-secondary.tb-lyric-overflow > .tb-lyric-scroll {
-  animation: tb-lyric-marquee var(--marquee-dur, 6s) linear infinite;
-}
-
-@keyframes tb-lyric-marquee {
-  0%, 18% {
-    transform: translateX(0);
-  }
-  82%, 100% {
-    transform: translateX(var(--scroll-offset, -50px));
-  }
-}
+/* 溢出滚动由 JS 按播放进度驱动 translateX,不再使用 CSS animation
+   .tb-lyric-overflow 仅作为溢出标记,保留 will-change 优化 GPU 合成 */
 
 /* 主歌词样式 */
 .tb-lyric-primary {
@@ -136,4 +125,82 @@ html.tb-lyric-visible {
   background-size: 200% 100%;
   background-repeat: no-repeat;
   will-change: background-position;
+}
+
+/* ==================== 悬停控件 ==================== */
+
+/* 悬停时歌词和封面淡出 */
+.tb-lyric-root.tb-lyric-hover .tb-lyric-text,
+.tb-lyric-root.tb-lyric-hover .tb-lyric-cover {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+/* 控件栏 — 极淡透明底 + 细微柔焦 */
+.tb-lyric-controls {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  z-index: 10;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  border-radius: 6px;
+  /* 极淡白底 + 细微模糊 */
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  /* 注: 不加 -webkit-app-region，按钮间隙继承 body 的 drag 区域 */
+}
+
+.tb-lyric-root.tb-lyric-hover .tb-lyric-controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 控件按钮 — 深色半透胶囊，在浅色/深色壁纸上均可见 */
+.tb-lyric-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.2);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+  line-height: 1;
+  padding: 0;
+  -webkit-app-region: no-drag;
+}
+
+.tb-lyric-btn:hover {
+  background: rgba(0, 0, 0, 0.35);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #fff;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.12);
+}
+
+.tb-lyric-btn:active {
+  transform: scale(0.9);
+}
+
+/* 播放/暂停按钮稍大 */
+.tb-lyric-btn.tb-lyric-btn-play {
+  width: 36px;
+  height: 36px;
+  font-size: 18px;
+}
+
+/* 图标按钮 (锁/喜欢) — SVG 居中容器 */
+.tb-lyric-btn.tb-lyric-btn-icon {
+  padding: 6px;
 }

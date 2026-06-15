@@ -17,9 +17,6 @@ export const CHANNEL_NAME = "echo-plugin:taskbar-lyric:settings";
 /** 浮窗窗口 ID，用于窗口管理 API */
 export const WINDOW_ID = "taskbar-lyric";
 
-/** 字体扫描缓存键 */
-export const FONT_CACHE_KEY = "__taskbar_lyric_font_cache";
-
 /** 默认设置对象 */
 export const DEFAULT_SETTINGS = {
   enabled: true,            // 是否启用插件
@@ -42,6 +39,8 @@ export const DEFAULT_SETTINGS = {
   showTranslation: true,    // 是否显示翻译
   showRomanization: false,  // 是否显示音译
   secondaryScroll: false,   // 副歌词是否启用跑马灯滚动
+  lyricFilterEnabled: false, // 是否启用歌词正则过滤
+  lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹", // 过滤正则模式
   emptyText: "EchoMusic",   // 无歌词时显示的文本
 };
 
@@ -81,6 +80,8 @@ export const normalizeSettings = (value) => {
     showTranslation: source.showTranslation ?? DEFAULT_SETTINGS.showTranslation,
     showRomanization: source.showRomanization ?? DEFAULT_SETTINGS.showRomanization,
     secondaryScroll: source.secondaryScroll ?? DEFAULT_SETTINGS.secondaryScroll,
+    lyricFilterEnabled: source.lyricFilterEnabled ?? DEFAULT_SETTINGS.lyricFilterEnabled,
+    lyricFilterPatterns: typeof source.lyricFilterPatterns === "string" ? source.lyricFilterPatterns : DEFAULT_SETTINGS.lyricFilterPatterns,
     emptyText: typeof source.emptyText === "string" ? source.emptyText : DEFAULT_SETTINGS.emptyText,
   };
 };

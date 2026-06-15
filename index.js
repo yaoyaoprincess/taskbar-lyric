@@ -36,6 +36,8 @@ const DEFAULT_SETTINGS = {
   showTranslation: true,
   showRomanization: false,
   secondaryScroll: false,
+  lyricFilterEnabled: false,
+  lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
   emptyText: "EchoMusic",
 };
 
@@ -72,203 +74,30 @@ const normalizeSettings = (value) => {
     showTranslation: source.showTranslation ?? DEFAULT_SETTINGS.showTranslation,
     showRomanization: source.showRomanization ?? DEFAULT_SETTINGS.showRomanization,
     secondaryScroll: source.secondaryScroll ?? DEFAULT_SETTINGS.secondaryScroll,
+    lyricFilterEnabled: source.lyricFilterEnabled ?? DEFAULT_SETTINGS.lyricFilterEnabled,
+    lyricFilterPatterns: typeof source.lyricFilterPatterns === "string" ? source.lyricFilterPatterns : DEFAULT_SETTINGS.lyricFilterPatterns,
     emptyText: typeof source.emptyText === "string" ? source.emptyText : DEFAULT_SETTINGS.emptyText,
   };
 };
 
 // ==================== 字体扫描 ====================
 
-/** 字体扫描缓存键 */
-const FONT_CACHE_KEY = "__taskbar_lyric_font_cache";
-
-/** 从 Uint8Array 读取 big-endian uint32 */
-const readUint32BE = (bytes, offset) =>
-  ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
-
-/** 从 Uint8Array 读取 big-endian uint16 */
-const readUint16BE = (bytes, offset) =>
-  ((bytes[offset] << 8) | bytes[offset + 1]) >>> 0;
-
-/** 读取 4 字节标签为字符串 */
-const readTag = (bytes, offset) =>
-  String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
-
-/** 从 UTF-16BE 编码的字节数组解码字符串 */
-const decodeUTF16BE = (bytes) => {
-  const len = bytes.length;
-  const chars = [];
-  for (let i = 0; i < len; i += 2) {
-    chars.push(String.fromCharCode((bytes[i] << 8) | bytes[i + 1]));
-  }
-  return chars.join("").replace(/\0/g, "");
-};
-
 /**
- * 解析 TTF/OTF 字体 name 表，提取字体系列名称
- * 读取文件头部最多 4096 字节
- *
- * 优先级:
- * 1. nameID=16 (Typographic Family), Windows, Unicode, 中文
- * 2. nameID=16, Windows, Unicode, 英文
- * 3. nameID=1 (Font Family), Windows, Unicode, 中文
- * 4. nameID=1, Windows, Unicode, 英文
- * 5. nameID=1, Mac Roman
- *
- * @param {Uint8Array} bytes - 字体文件字节
- * @returns {string|null} 字体系列名称
- */
-const parseFontFamily = (bytes) => {
-  if (!bytes || bytes.length < 12) return null;
-
-  let offset = 0;
-
-  // 检查是否为 TTC (TrueType Collection)
-  const tag = readTag(bytes, 0);
-  if (tag === "ttcf") {
-    if (bytes.length < 16) return null;
-    offset = readUint32BE(bytes, 12);
-    if (offset + 12 > bytes.length) return null;
-  }
-
-  // 解析 TTF/OTF 表目录
-  const numTables = readUint16BE(bytes, offset + 4);
-  if (numTables === 0 || numTables > 100) return null;
-  if (offset + 12 + numTables * 16 > bytes.length) return null;
-
-  // 查找 name 表
-  let nameOffset = -1;
-  const tableStart = offset + 12;
-  for (let i = 0; i < numTables; i++) {
-    const recOff = tableStart + i * 16;
-    if (readTag(bytes, recOff) === "name") {
-      nameOffset = readUint32BE(bytes, recOff + 8);
-      break;
-    }
-  }
-
-  if (nameOffset < 0 || nameOffset + 6 > bytes.length) return null;
-
-  // 解析 name 表
-  const nameCount = readUint16BE(bytes, nameOffset + 2);
-  const strOffset = readUint16BE(bytes, nameOffset + 4);
-  const recBase = nameOffset + 6;
-
-  if (recBase + nameCount * 12 > bytes.length) return null;
-
-  // 候选名称（按优先级排序）
-  const candidates = [];
-
-  for (let i = 0; i < nameCount; i++) {
-    const off = recBase + i * 12;
-    const platformID = readUint16BE(bytes, off);
-    const encodingID = readUint16BE(bytes, off + 2);
-    const languageID = readUint16BE(bytes, off + 4);
-    const nameID = readUint16BE(bytes, off + 6);
-    const length = readUint16BE(bytes, off + 8);
-    const strOff = readUint16BE(bytes, off + 10);
-
-    // 只关心 Font Family (1) 和 Typographic Family (16)
-    if (nameID !== 1 && nameID !== 16) continue;
-
-    const absOff = nameOffset + strOffset + strOff;
-    if (absOff + length > bytes.length) continue;
-
-    let text = null;
-    if (platformID === 3 && encodingID === 1) {
-      // Windows Unicode BMP (UTF-16BE)
-      text = decodeUTF16BE(bytes.slice(absOff, absOff + length));
-    } else if (platformID === 1 && encodingID === 0) {
-      // Mac Roman (ASCII)
-      const slice = bytes.slice(absOff, absOff + length);
-      text = String.fromCharCode(...slice).replace(/\0/g, "");
-    }
-
-    if (text && text.trim()) {
-      const priority =
-        nameID === 16 ? (languageID === 2052 ? 100 : languageID === 1033 ? 90 : 80) :
-        nameID === 1  ? (languageID === 2052 ? 70  : languageID === 1033 ? 60 : 50) : 0;
-      candidates.push({ text: text.trim(), priority });
-    }
-  }
-
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.priority - a.priority);
-  return candidates[0].text;
-};
-
-/**
- * 扫描系统字体目录
- * 读取 .ttf/.ttc/.otf 文件，解析字体系列名称
- * 结果缓存到 ctx.storage
+ * 获取系统字体列表
+ * EchoMusic 内置 ctx.fonts API，无需手动解析 TTF/OTF。
  *
  * @param {Object} ctx - 插件上下文
  * @returns {Promise<string[]>} 字体名称数组
  */
-const scanSystemFonts = async (ctx) => {
-  const platform = ctx.electron?.platform || "win32";
-  const fontDirs = platform === "win32"
-    ? ["C:\\Windows\\Fonts"]
-    : platform === "darwin"
-      ? ["/System/Library/Fonts", "/Library/Fonts"]
-      : ["/usr/share/fonts", "/usr/local/share/fonts"];
-
-  const fonts = new Set();
-  let totalFiles = 0;
-  let parsedFiles = 0;
-
-  for (const dir of fontDirs) {
-    try {
-      const result = await ctx.fs.listFiles(dir, {
-        extensions: [".ttf", ".ttc", ".otf"],
-        limit: 500,
-      });
-
-      const files = Array.isArray(result?.files) ? result.files : (Array.isArray(result) ? result : []);
-      totalFiles += files.length;
-
-      for (const file of files) {
-        const filePath = typeof file === "string" ? file : file.path;
-        if (!filePath) continue;
-
-        try {
-          const bytes = await ctx.fs.readFileBytes(filePath, { maxBytes: 4096 });
-          const name = parseFontFamily(bytes);
-
-          if (name) {
-            fonts.add(name);
-            parsedFiles++;
-          } else {
-            // 回退：从文件名提取
-            const fileName = filePath.split(/[/\\]/).pop();
-            const baseName = fileName.replace(/\.(ttf|ttc|otf)$/i, "");
-            const cleaned = baseName
-              .replace(/[-_]+/g, " ")
-              .replace(/([a-z])([A-Z])/g, "$1 $2")
-              .trim();
-            if (cleaned) fonts.add(cleaned);
-          }
-        } catch {
-          // 单个文件解析失败，跳过
-        }
-      }
-    } catch {
-      // 目录不可访问，跳过
-    }
+const getSystemFonts = async (ctx) => {
+  try {
+    const allFonts = await ctx.fonts.getAll();
+    return Array.isArray(allFonts)
+      ? [...allFonts].sort((a, b) => a.localeCompare(b, "zh"))
+      : [];
+  } catch {
+    return [];
   }
-
-  const fontList = [...fonts].sort((a, b) => a.localeCompare(b, "zh"));
-
-  // 缓存结果（24 小时有效）
-  if (fontList.length > 0) {
-    await ctx.storage.set(FONT_CACHE_KEY, {
-      fonts: fontList,
-      updatedAt: Date.now(),
-      totalFiles,
-      parsedFiles,
-    });
-  }
-
-  return fontList;
 };
 
 // 模块级状态
@@ -472,11 +301,11 @@ const createSettingsComponent = (ctx) =>
         { deep: true },
       );
 
-      // 组件挂载时从 storage 重新加载，确?draft 包含浮窗端所做的更改
-      // 浮窗?lock 时会?manualAdjust/偏移写入 storage，但 state.settings 不会自动同步
+      // 组件挂载时加载字体、同步 storage 中的设置
       onMounted(async () => {
         try {
-          await loadFontCache();
+          const list = await getSystemFonts(ctx);
+          if (list.length > 0) fonts.value = list;
           const stored = await ctx.storage.get(STORAGE_KEY);
           if (stored && typeof stored === "object") {
             Object.assign(draft, normalizeSettings(stored));
@@ -510,46 +339,63 @@ const createSettingsComponent = (ctx) =>
         }
       };
 
-      // 加载字体缓存（从 storage）
-      const loadFontCache = async () => {
-        try {
-          const cache = await ctx.storage.get(FONT_CACHE_KEY);
-          if (cache?.fonts?.length > 0) {
-            fonts.value = cache.fonts;
-          }
-        } catch { /* 静默忽略 */ }
-      };
-
-      // 扫描系统字体
+      // 刷新系统字体列表（用户点击按钮时）
       const scanFonts = async () => {
         if (scanningFonts.value) return;
         scanningFonts.value = true;
-        fontMessage.value = "正在扫描系统字体...";
+        fontMessage.value = "正在加载系统字体...";
         try {
-          const list = await scanSystemFonts(ctx);
+          const list = await getSystemFonts(ctx);
           fonts.value = list;
           fontMessage.value = list.length > 0 ? `找到 ${list.length} 个字体` : "未找到字体";
-          if (list.length > 0) ctx.toast.success(`已扫描 ${list.length} 个系统字体`);
-          else ctx.toast.warning("未找到系统字体");
         } catch (e) {
-          fontMessage.value = "扫描失败: " + (e?.message || "未知错误");
-          ctx.toast.warning("字体扫描失败");
+          fontMessage.value = "加载失败: " + (e?.message || "未知错误");
         } finally {
           scanningFonts.value = false;
         }
       };
+
+      // 字体下拉框展开状态
+      const showFontDropdown = ref(false);
+      const fontDropdownRef = ref(null);
+      const toggleFontDropdown = () => { showFontDropdown.value = !showFontDropdown.value; };
+      const selectFont = (font) => { setDraftValue("fontFamily", font); showFontDropdown.value = false; };
+      const handleFontDropdownClick = () => { showFontDropdown.value = false; };
+      // 点击外部关闭下拉框
+      const onFontClickOutside = (e) => {
+        if (fontDropdownRef.value && !fontDropdownRef.value.contains(e.target)) {
+          showFontDropdown.value = false;
+        }
+      };
+      onMounted(() => {
+        document.addEventListener("click", onFontClickOutside, true);
+      });
 
       // 渲染字体选择器
       const renderFontSelector = () =>
         h("div", { class: "tb-lyric-settings-font-section" }, [
           h("label", { class: "tb-lyric-settings-field" }, [
             h("span", { class: "tb-lyric-settings-label" }, "字体名称"),
-            h(Input, {
-              modelValue: draft.fontFamily,
-              placeholder: "留空使用系统默认",
-              class: "tb-lyric-settings-input",
-              "onUpdate:modelValue": (value) => setDraftValue("fontFamily", String(value ?? "")),
-            }),
+            h("div", { class: "tb-lyric-settings-font-dropdown", ref: fontDropdownRef }, [
+              h("button", {
+                class: "tb-lyric-settings-select-trigger",
+                onClick: toggleFontDropdown,
+                type: "button",
+              }, draft.fontFamily || "系统默认"),
+              showFontDropdown.value ? h("div", { class: "tb-lyric-settings-select-dropdown" }, [
+                h("div", {
+                  class: ["tb-lyric-settings-select-option", !draft.fontFamily ? "active" : ""],
+                  onClick: () => selectFont(""),
+                }, "系统默认"),
+                ...fonts.value.map((font) =>
+                  h("div", {
+                    class: ["tb-lyric-settings-select-option", draft.fontFamily === font ? "active" : ""],
+                    style: { fontFamily: font },
+                    onClick: () => selectFont(font),
+                  }, font)
+                ),
+              ]) : null,
+            ]),
           ]),
           h("div", { class: "tb-lyric-settings-font-actions" }, [
             h(Button, {
@@ -561,19 +407,6 @@ const createSettingsComponent = (ctx) =>
             }, { default: () => scanningFonts.value ? "扫描中..." : "扫描系统字体" }),
             fontMessage.value ? h("span", { class: "tb-lyric-settings-message" }, fontMessage.value) : null,
           ]),
-          fonts.value.length > 0 ? h("div", { class: "tb-lyric-settings-font-list" }, [
-            h("button", {
-              class: ["tb-lyric-settings-font-item", !draft.fontFamily ? "active" : ""],
-              onClick: () => setDraftValue("fontFamily", ""),
-            }, "系统默认"),
-            ...fonts.value.map((font) =>
-              h("button", {
-                class: ["tb-lyric-settings-font-item", draft.fontFamily === font ? "active" : ""],
-                style: { fontFamily: font },
-                onClick: () => setDraftValue("fontFamily", font),
-              }, font)
-            ),
-          ]) : null,
         ]);
 
       // 恢复默认设置
@@ -681,6 +514,13 @@ const createSettingsComponent = (ctx) =>
             renderSwitchRow("showRomanization", "显示音译", "当歌词有音译且开启时显示"),
             renderSwitchRow("secondaryScroll", "副歌词跑马灯", "副歌词过长时启用滚动效果"),
             renderInputField("emptyText", "无歌词文本", "留空则隐藏"),
+          ]),
+          // 过滤设置
+          renderSection("过滤", "用正则式忽略歌词行（制作信息、版权信息等）", [
+            renderSwitchRow("lyricFilterEnabled", "启用歌词过滤", "开启后隐藏匹配正则的歌词行"),
+            draft.lyricFilterEnabled
+              ? renderInputField("lyricFilterPatterns", "过滤正则式", "例：作词|作曲|编曲")
+              : null,
           ]),
           // 封面设置
           renderSection("封面", "控制专辑封面的显示和位置", [
@@ -1065,47 +905,78 @@ export async function activate(ctx) {
   gap: 10px;
 }
 
-.tb-lyric-settings-font-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  max-height: 200px;
-  overflow-y: auto;
-  padding: 4px 2px;
+.tb-lyric-settings-font-dropdown {
+  position: relative;
+  width: 100%;
 }
 
-.tb-lyric-settings-font-list::-webkit-scrollbar {
+.tb-lyric-settings-select-trigger {
+  width: 100%;
+  height: 36px;
+  padding: 0 36px 0 12px;
+  border: 1px solid color-mix(in srgb, var(--color-text-main, #f8fafc) 14%, transparent);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text-main, var(--text-main, #f8fafc));
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  outline: none;
+  transition: border-color 0.2s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+
+.tb-lyric-settings-select-trigger:hover {
+  border-color: color-mix(in srgb, var(--color-text-main, #f8fafc) 28%, transparent);
+}
+
+.tb-lyric-settings-select-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  margin-top: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid color-mix(in srgb, var(--color-text-main, #f8fafc) 14%, transparent);
+  border-radius: 8px;
+  background: var(--surface-elevated-base, #111827);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+
+.tb-lyric-settings-select-dropdown::-webkit-scrollbar {
   width: 4px;
 }
 
-.tb-lyric-settings-font-list::-webkit-scrollbar-thumb {
+.tb-lyric-settings-select-dropdown::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--color-text-main, #f8fafc) 20%, transparent);
   border-radius: 2px;
 }
 
-.tb-lyric-settings-font-item {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border: 1px solid color-mix(in srgb, var(--color-text-main, #f8fafc) 14%, transparent);
-  border-radius: 5px;
-  background: transparent;
-  color: var(--color-text-secondary, var(--text-secondary, rgba(148, 163, 184, 0.9)));
+.tb-lyric-settings-select-option {
+  padding: 8px 12px;
   font-size: 13px;
+  color: var(--color-text-secondary, var(--text-secondary, rgba(148, 163, 184, 0.9)));
   cursor: pointer;
-  transition: all 0.2s ease;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.15s ease;
 }
 
-.tb-lyric-settings-font-item:hover {
+.tb-lyric-settings-select-option:hover {
   background: color-mix(in srgb, var(--color-text-main, #f8fafc) 8%, transparent);
-  border-color: color-mix(in srgb, var(--color-text-main, #f8fafc) 28%, transparent);
 }
 
-.tb-lyric-settings-font-item.active {
+.tb-lyric-settings-select-option.active {
   background: color-mix(in srgb, var(--color-primary, #31cfa1) 16%, transparent);
   color: var(--color-primary, #31cfa1);
-  border-color: var(--color-primary, #31cfa1);
 }
 
 @media (max-width: 640px) {
