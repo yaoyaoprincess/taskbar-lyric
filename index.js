@@ -89,17 +89,6 @@ const normalizeSettings = (value) => {
  * @param {Object} ctx - 插件上下文
  * @returns {Promise<string[]>} 字体名称数组
  */
-const getSystemFonts = async (ctx) => {
-  try {
-    const allFonts = await ctx.fonts.getAll();
-    return Array.isArray(allFonts)
-      ? [...allFonts].sort((a, b) => a.localeCompare(b, "zh"))
-      : [];
-  } catch {
-    return [];
-  }
-};
-
 // 模块级状态
 let state = null;              // 插件状态（包含设置）
 let channel = null;            // BroadcastChannel 实例
@@ -288,8 +277,6 @@ const createSettingsComponent = (ctx) =>
       const saving = ref(false);
       const message = ref("");
       const fonts = ref([]);
-      const scanningFonts = ref(false); // 字体扫描中标志
-      const fontMessage = ref("");      // 字体扫描状态消息
       // 监听设置变化，同步到草稿
       watch(
         () => state?.settings,
@@ -304,7 +291,8 @@ const createSettingsComponent = (ctx) =>
       // 组件挂载时加载字体、同步 storage 中的设置
       onMounted(async () => {
         try {
-          const list = await getSystemFonts(ctx);
+          const all = await ctx.fonts.getAll();
+          const list = Array.isArray(all) ? [...all].sort((a, b) => a.localeCompare(b, "zh")) : [];
           if (list.length > 0) fonts.value = list;
           const stored = await ctx.storage.get(STORAGE_KEY);
           if (stored && typeof stored === "object") {
@@ -339,28 +327,11 @@ const createSettingsComponent = (ctx) =>
         }
       };
 
-      // 刷新系统字体列表（用户点击按钮时）
-      const scanFonts = async () => {
-        if (scanningFonts.value) return;
-        scanningFonts.value = true;
-        fontMessage.value = "正在加载系统字体...";
-        try {
-          const list = await getSystemFonts(ctx);
-          fonts.value = list;
-          fontMessage.value = list.length > 0 ? `找到 ${list.length} 个字体` : "未找到字体";
-        } catch (e) {
-          fontMessage.value = "加载失败: " + (e?.message || "未知错误");
-        } finally {
-          scanningFonts.value = false;
-        }
-      };
-
       // 字体下拉框展开状态
       const showFontDropdown = ref(false);
       const fontDropdownRef = ref(null);
       const toggleFontDropdown = () => { showFontDropdown.value = !showFontDropdown.value; };
       const selectFont = (font) => { setDraftValue("fontFamily", font); showFontDropdown.value = false; };
-      const handleFontDropdownClick = () => { showFontDropdown.value = false; };
       // 点击外部关闭下拉框
       const onFontClickOutside = (e) => {
         if (fontDropdownRef.value && !fontDropdownRef.value.contains(e.target)) {
@@ -396,16 +367,6 @@ const createSettingsComponent = (ctx) =>
                 ),
               ]) : null,
             ]),
-          ]),
-          h("div", { class: "tb-lyric-settings-font-actions" }, [
-            h(Button, {
-              size: "xs",
-              variant: "ghost",
-              loading: scanningFonts.value,
-              disabled: scanningFonts.value,
-              onClick: scanFonts,
-            }, { default: () => scanningFonts.value ? "扫描中..." : "扫描系统字体" }),
-            fontMessage.value ? h("span", { class: "tb-lyric-settings-message" }, fontMessage.value) : null,
           ]),
         ]);
 
@@ -896,12 +857,6 @@ export async function activate(ctx) {
 /* 字体选择器 */
 .tb-lyric-settings-font-section {
   display: grid;
-  gap: 10px;
-}
-
-.tb-lyric-settings-font-actions {
-  display: flex;
-  align-items: center;
   gap: 10px;
 }
 
