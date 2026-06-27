@@ -250,11 +250,21 @@ const calculateLineIndex = (lines, seekMs) => {
 /** 从指定索引起查找第一个未被过滤的可见行索引
  *  供 tickLyric 和 nextLine 使用，在过滤启用时跳过匹配正则的行
  *  @returns {number} 原始行索引（若全部匹配则返回最后一行降级显示） */
+
+// 缓存编译后的正则，避免每 33ms 重新编译
+let _filterRegexCache = null;
+let _filterRegexSource = null;
+
 const findNextVisibleIndex = (fromIndex, lines, settings) => {
   if (!settings.lyricFilterEnabled || !settings.lyricFilterPatterns?.trim()) return fromIndex;
   if (fromIndex < 0 || !lines || fromIndex >= lines.length) return fromIndex;
   try {
-    const regex = new RegExp(settings.lyricFilterPatterns, 'i');
+    const pattern = settings.lyricFilterPatterns;
+    if (_filterRegexSource !== pattern) {
+      _filterRegexSource = pattern;
+      _filterRegexCache = new RegExp(pattern, 'i');
+    }
+    const regex = _filterRegexCache;
     let i = fromIndex;
     while (i < lines.length) {
       const text = String(lines[i]?.text || "").trim();
@@ -332,6 +342,8 @@ export function activateWindow(ctx) {
           if (!payload || payload.type !== "settings") return;
           receivedFromChannel = true;
           Object.assign(settings, payload.settings);
+          // BroadcastChannel 可用，停止 storage 轮询空转
+          if (settingsSyncTimer) { clearInterval(settingsSyncTimer); settingsSyncTimer = null; }
         };
       };
 
@@ -466,33 +478,93 @@ export function activateWindow(ctx) {
         snapshot.value?.playback?.cover || snapshot.value?.playback?.coverUrl || "",
       );
 
-      // ==================== 悬停控件 ====================
-
-      /** 悬停状态:鼠标移入时显示控件、淡出歌词;移出后恢复 */
+      // ==================== 悬停控件 (v3) ====================
+      /**
+       *  v3 策略：mouseenter 做主触发 + 一次性 mousemove 兜底
+       *  ① mouseenter 只在边界跨越时触发 = 明确交互意图，不会误触
+       *  ② 80ms 延迟 setIgnoreMouseEvents(false) + 可取消：80ms 内 mouseleave 则放弃
+       *  ③ 挂载后 600ms 内短暂监听 mousemove：检测鼠标是否已在窗口上方
+       *  ④ 双路 mouseleave（root + document）确保离开检测可靠
+       */
+      // ——— 进入/离开状态管理 ———
       const isHovered = ref(false);
       let leaveDebounce = null;
+      let hoverModeTimer = null;
+      let isHoverModeActive = false; // 保证 enter/leave 对称，防双重调用竞态
+      let watchDogTimer = null;       // mousemove 心跳：3s 无动静 = 强制复位
 
-      const onMouseEnter = () => {
+      const cancelHoverTimer = () => {
+        if (hoverModeTimer) { clearTimeout(hoverModeTimer); hoverModeTimer = null; }
+      };
+
+      const armWatchDog = () => {
+        disarmWatchDog();
+        watchDogTimer = setTimeout(() => {
+          forceLeave();
+        }, 3000);
+      };
+      const disarmWatchDog = () => {
+        if (watchDogTimer) { clearTimeout(watchDogTimer); watchDogTimer = null; }
+      };
+      const onWatchDogMove = () => {
+        if (isHovered.value) armWatchDog();
+      };
+
+      /** 强制离开 — 重置所有状态，恢复鼠标穿透 */
+      const forceLeave = () => {
+        disarmWatchDog();
+        cancelHoverTimer();
         if (leaveDebounce) { clearTimeout(leaveDebounce); leaveDebounce = null; }
-        if (!isHovered.value) {
-          isHovered.value = true;
-          // 切换到全交互模式,允许点击控件按钮
+        isHovered.value = false;
+        isHoverModeActive = false;
+        document.removeEventListener('mousemove', onWatchDogMove);
+        if (settings.lockPosition) {
+          ctx.window.setIgnoreMouseEvents(true, { forward: true });
+        } else {
           ctx.window.setIgnoreMouseEvents(false);
         }
       };
 
-      const onMouseLeave = () => {
-        // 300ms 防抖,避免快速扫过时闪烁
+      // mouseenter 为主触发：每次边界跨越都重新启动 80ms 定时器
+      const onMouseEnter = () => {
+        if (!isHoverModeActive) {
+          isHoverModeActive = true;
+          document.addEventListener('mousemove', onWatchDogMove);
+        }
+        if (leaveDebounce) { clearTimeout(leaveDebounce); leaveDebounce = null; }
+        cancelHoverTimer();
+        isHovered.value = true;
+        // 80ms 后切交互模式，可被 mouseleave 取消
+        hoverModeTimer = setTimeout(() => {
+          hoverModeTimer = null;
+          if (isHovered.value && !leaveDebounce) {
+            ctx.window.setIgnoreMouseEvents(false);
+            armWatchDog();
+          }
+        }, 80);
+      };
+
+      // ——— 离开 debounce ———
+      const startLeaveDebounce = () => {
+        if (!isHoverModeActive) return; // 已在离开流程中
+        cancelHoverTimer();
+        if (leaveDebounce) clearTimeout(leaveDebounce);
         leaveDebounce = setTimeout(() => {
+          leaveDebounce = null;
           isHovered.value = false;
-          // 恢复穿透模式
+          isHoverModeActive = false;
+          disarmWatchDog();
+          document.removeEventListener('mousemove', onWatchDogMove);
           if (settings.lockPosition) {
             ctx.window.setIgnoreMouseEvents(true, { forward: true });
           } else {
             ctx.window.setIgnoreMouseEvents(false);
           }
-        }, 300);
+        }, 150);
       };
+
+      const onRootMouseLeave = () => { startLeaveDebounce(); };
+      const onDocMouseLeave = () => { startLeaveDebounce(); };
 
       /** 切换锁定状态(控件栏锁按钮) */
       const toggleLock = async () => {
@@ -541,15 +613,52 @@ export function activateWindow(ctx) {
         }),
       ]);
 
+      /** 不喜欢图标 — 心形带斜线（FM 模式用） */
+      const dislikeIcon = () => h("svg", {
+        width: 16, height: 16, viewBox: "0 0 24 24",
+        fill: "none", stroke: "currentColor",
+        "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round",
+      }, [
+        h("path", {
+          d: "M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z",
+        }),
+        h("line", { x1: 1, y1: 1, x2: 23, y2: 23 }),
+      ]);
+
       // ==================== 喜欢状态（来源：snapshot） ====================
 
       /** 喜欢状态直接从播放快照读取
        *  EchoMusic >= 2.2.6 起 snapshot.playback.isFavorite 由主进程维护 */
       const isLiked = computed(() => snapshot.value?.playback?.isFavorite ?? false);
 
+      /** FM 模式检测 */
+      const isPersonalFM = computed(() => snapshot.value?.playback?.isPersonalFM ?? false);
+
       /** 收藏切换（控件按钮调用）*/
       const toggleFavorite = () => {
         ctx.nowPlaying.command('toggleFavorite').catch(() => {});
+      };
+
+      /** FM 不喜欢：上报 garbage + 切下一首
+       *  T1: ctx.player.dislikePersonalFm() — 完整流程（上报+跳过）
+       *  T2: BroadcastChannel → index.js → ctx.player.dislikePersonalFm() — 跨上下文回退
+       *  T3: IPC ctx.nowPlaying.command("nextTrack") — 仅跳过（不报 garbage） */
+      const dislikeFm = async () => {
+        // T1: 窗口直接调用 player API（如可用）
+        if (ctx.player && typeof ctx.player.dislikePersonalFm === 'function') {
+          try {
+            await ctx.player.dislikePersonalFm();
+            return;
+          } catch (e) {
+            // fall through
+          }
+        }
+        // T2: 通过 BroadcastChannel 中转到 index.js
+        try {
+          channel?.postMessage({ type: "command", command: "dislikeFm" });
+        } catch {}
+        // T3: IPC 纯跳过（兜底，与 T2 并行）
+        ctx.nowPlaying.command("nextTrack").catch(() => {});
       };
 
       /**
@@ -679,19 +788,65 @@ export function activateWindow(ctx) {
           } catch { /* storage 轮询失败静默忽略 */ }
         }, 1000);
 
-        // 7. 窗口心跳:每 2s 写时间戳到 storage,供主进程检测窗口存活。
-        let heartbeatTimer = setInterval(async () => {
-          try { await ctx.storage.set("__taskbar_lyric_heartbeat", Date.now()); } catch {}
+        // 7. 屏幕几何变化检测（解决掀盖唤醒/外接显示器/DPI 变化后浮窗漂移问题）
+        let lastScreenKey = null;
+        const checkScreenAndReposition = () => {
+          const info = detectTaskbarInfo();
+          const key = `${info.position}|${info.size}|${info.screenWidth}|${info.screenHeight}`;
+          if (lastScreenKey !== key) {
+            lastScreenKey = key;
+            // 仅在锁定时重新定位；解锁时由用户自由拖拽
+            if (settings.lockPosition) positionToTaskbar(ctx, settings);
+          }
+        };
+        // 首次记录当前屏幕几何
+        checkScreenAndReposition();
+
+        // 8. 窗口心跳：每 2s 通过 BroadcastChannel 发心跳到主插件
+        //    （置顶使用一次性的 screen-saver 级别，无需周期性重设）
+        let keepaliveTimer = setInterval(() => {
+          channel?.postMessage({ type: "heartbeat", ts: Date.now() });
+          checkScreenAndReposition();
         }, 2000);
-        // 立即写入首次心跳
-        try { await ctx.storage.set("__taskbar_lyric_heartbeat", Date.now()); } catch {}
+        // 立即发送首次心跳
+        channel?.postMessage({ type: "heartbeat", ts: Date.now() });
 
-        // 8. 置顶保活（第一道防线）：每 3s 调 setAlwaysOnTop(true) 重新声明置顶
-        let topmostTimer = setInterval(() => {
-          try { ctx.window.setAlwaysOnTop(true); } catch {}
-        }, 3000);
+        // 9. resize 事件快速响应（显示器连接/断开、DPI 变化）
+        const onScreenResize = () => { checkScreenAndReposition(); };
+        window.addEventListener('resize', onScreenResize);
 
-        // 9. 根据锁定状态设置鼠标穿透与拖拽(默认锁定 = 透传 mousemove 用于检测悬停)
+        // 9b. 悬停离开兜底：document mouseleave 确保鼠标离开 Electron 窗口时可靠触发
+        document.addEventListener('mouseleave', onDocMouseLeave);
+
+        // 9c. 一次性 mousemove 快照：挂载后 600ms 内检测鼠标是否已在窗口上方
+        let initHoverSnapshot = null;
+        let initHoverTimer = setTimeout(() => {
+          document.removeEventListener('mousemove', initHoverSnapshot);
+          initHoverSnapshot = null;
+        }, 600);
+        initHoverSnapshot = () => {
+          if (leaveDebounce) return;
+          isHoverModeActive = true;
+          document.addEventListener('mousemove', onWatchDogMove);
+          cancelHoverTimer();
+          isHovered.value = true;
+          hoverModeTimer = setTimeout(() => {
+            hoverModeTimer = null;
+            if (isHovered.value && !leaveDebounce) {
+              ctx.window.setIgnoreMouseEvents(false);
+              armWatchDog();
+            }
+          }, 80);
+          clearTimeout(initHoverTimer);
+          document.removeEventListener('mousemove', initHoverSnapshot);
+          initHoverSnapshot = null;
+        };
+        document.addEventListener('mousemove', initHoverSnapshot);
+
+        // 10. 桌面歌词级置顶：screen-saver 级别一次设好，无需周期性重设
+        ctx.window.setAlwaysOnTop(true, 'screen-saver');
+
+        // 11. 根据锁定状态设置鼠标穿透与拖拽(默认锁定 = 透传 mousemove 用于检测悬停)
         if (settings.lockPosition) {
           ctx.window.setIgnoreMouseEvents(true, { forward: true });
           document.body.style.setProperty('-webkit-app-region', 'no-drag');
@@ -700,7 +855,7 @@ export function activateWindow(ctx) {
           document.body.style.setProperty('-webkit-app-region', 'drag');
         }
 
-        // 10. 淡入显示窗口
+        // 12. 淡入显示窗口
         requestAnimationFrame(() => {
           document.documentElement.classList.add("tb-lyric-visible");
           // 首屏溢出检测(等待字体加载完成后再测一次更精确)
@@ -741,13 +896,17 @@ export function activateWindow(ctx) {
         stopWatchLock?.();
         stopWatchOverflow?.();
 
+        window.removeEventListener('resize', onScreenResize);
+        document.removeEventListener('mouseleave', onDocMouseLeave);
+        if (initHoverSnapshot) { document.removeEventListener('mousemove', initHoverSnapshot); clearTimeout(initHoverTimer); }
+        if (hoverModeTimer) clearTimeout(hoverModeTimer);
+        if (leaveDebounce) clearTimeout(leaveDebounce);
+        disarmWatchDog();
+        document.removeEventListener('mousemove', onWatchDogMove);
         snapshotDispose?.();
         if (clockTimer) clearInterval(clockTimer);
         if (settingsSyncTimer) clearInterval(settingsSyncTimer);
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        if (topmostTimer) clearInterval(topmostTimer);
-        // 清除心跳标记(fire-and-forget)
-        ctx.storage.set("__taskbar_lyric_heartbeat", null).catch(() => {});
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
         channel?.close();
       });
 
@@ -854,13 +1013,20 @@ export function activateWindow(ctx) {
             : null,
         ]);
 
-        // 悬停控件栏
+        // 悬停控件栏 — FM 模式：不喜欢 + 暂停 + 下一首 + 喜欢 + 锁定
+        //                 普通模式：上一首 + 暂停 + 下一首 + 喜欢 + 锁定
         const controlsElement = h("div", { class: "tb-lyric-controls" }, [
-          h("button", {
-            class: "tb-lyric-btn",
-            title: "上一首",
-            onClick: (e) => { e.stopPropagation(); ctx.nowPlaying.command("previousTrack").catch(() => {}); },
-          }, "\u23EE"),
+          isPersonalFM.value
+            ? h("button", {
+                class: ["tb-lyric-btn", "tb-lyric-btn-icon"],
+                title: "不喜欢",
+                onClick: (e) => { e.stopPropagation(); dislikeFm(); },
+              }, dislikeIcon())
+            : h("button", {
+                class: "tb-lyric-btn",
+                title: "上一首",
+                onClick: (e) => { e.stopPropagation(); ctx.nowPlaying.command("previousTrack").catch(() => {}); },
+              }, "\u23EE"),
           h("button", {
             class: ["tb-lyric-btn", "tb-lyric-btn-play"],
             title: isPlaying ? "暂停" : "播放",
@@ -890,7 +1056,7 @@ export function activateWindow(ctx) {
         return h("div", {
           class: ["tb-lyric-root", showCover ? "has-cover" : "", isHovered.value ? "tb-lyric-hover" : ""],
           onMouseenter: onMouseEnter,
-          onMouseleave: onMouseLeave,
+          onMouseleave: onRootMouseLeave,
         }, children);
       };
     },

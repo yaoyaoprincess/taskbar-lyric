@@ -92,6 +92,8 @@ const normalizeSettings = (value) => {
 // 模块级状态
 let state = null;              // 插件状态（包含设置）
 let channel = null;            // BroadcastChannel 实例
+let lastWindowHeartbeat = 0;   // 最后收到浮窗心跳时间戳
+let heartbeatMissCount = 0;    // 连续丢失心跳计数
 let settingsDispose = null;    // 设置面板清理函数
 let windowRecoveryTimer = null; // 心跳恢复定时器（30s 检测窗口存活）
 let applyingRemoteSettings = false; // 防止设置同步循环
@@ -128,11 +130,27 @@ const setupSettingsChannel = (ctx) => {
   channel = new BroadcastChannel(CHANNEL_NAME);
   channel.onmessage = (event) => {
     const payload = event.data;
-    if (!payload || payload.type !== "settings") return;
-    applyingRemoteSettings = true;
-    void applySettings(ctx, payload.settings, { broadcast: false }).finally(
-      () => { applyingRemoteSettings = false; },
-    );
+    if (!payload) return;
+    if (payload.type === "heartbeat") {
+      lastWindowHeartbeat = payload.ts;
+      heartbeatMissCount = 0; // 心跳恢复，重置丢失计数
+      return;
+    }
+    if (payload.type === "settings") {
+      applyingRemoteSettings = true;
+      void applySettings(ctx, payload.settings, { broadcast: false }).finally(
+        () => { applyingRemoteSettings = false; },
+      );
+      return;
+    }
+    if (payload.type === "command") {
+      if (payload.command === "dislikeFm" && ctx.player?.dislikePersonalFm) {
+        ctx.player.dislikePersonalFm().catch((e) => {
+          console.warn("[taskbar-lyric] dislikeFm via channel failed:", e);
+        });
+      }
+      return;
+    }
   };
 };
 
@@ -265,7 +283,7 @@ const createSettingsComponent = (ctx) =>
   ctx.vue.defineComponent({
     name: "TaskbarLyricSettings",
     setup() {
-      const { h, reactive, ref, watch, onMounted, defineAsyncComponent } = ctx.vue;
+      const { h, reactive, ref, watch, onMounted, onBeforeUnmount, defineAsyncComponent } = ctx.vue;
       // 异步加载 UI 组件
       const Button = defineAsyncComponent(ctx.ui.components.Button);
       const Input = defineAsyncComponent(ctx.ui.components.Input);
@@ -340,6 +358,9 @@ const createSettingsComponent = (ctx) =>
       };
       onMounted(() => {
         document.addEventListener("click", onFontClickOutside, true);
+      });
+      onBeforeUnmount(() => {
+        document.removeEventListener("click", onFontClickOutside, true);
       });
 
       // 渲染字体选择器
@@ -974,17 +995,27 @@ export async function activate(ctx) {
   );
   ctx.dispose(stopWatchDim);
 
-  // 主动常驻轮询：每 1s 调 recoverWindow 重新声明置顶+显示，浮窗自带 topmostTimer 兜底 z-order。解锁时跳过 recoverWindow，同时检查心跳（>3s 未更新则重建窗口）
-  windowRecoveryTimer = setInterval(async () => {
+  // 窗口保活轮询：每 1s 轻量恢复置顶，通过 BroadcastChannel 心跳检测窗口存活。
+  // 仅锁定时保活以免干扰拖拽。窗口真的死了（连续 3 次无心跳 = 6s）才重建。
+  windowRecoveryTimer = setInterval(() => {
     try {
-      // 仅锁定时主动保活，避免干扰拖?
       if (state.settings.lockPosition) {
         recoverWindow(ctx);
       }
-      // 检查进程心跳（兜底：进程真的死了才需要完整重建）
-      const lastBeat = await ctx.storage.get("__taskbar_lyric_heartbeat");
-      if (lastBeat && Date.now() - lastBeat > 3000) {
-        showWindow(ctx);
+      // 通过 BroadcastChannel 心跳检测浮窗是否存活
+      const sinceBeat = Date.now() - lastWindowHeartbeat;
+      if (lastWindowHeartbeat && sinceBeat > 3000) {
+        heartbeatMissCount++;
+        if (heartbeatMissCount === 1) {
+          // 首次丢失：轻量恢复置顶（可能是 Chromium 节流导致 show "刷新"）
+          recoverWindow(ctx);
+        } else if (heartbeatMissCount >= 3) {
+          // 连续丢失 >=3 次（~9s）：窗口可能真的崩溃了，完整重建
+          showWindow(ctx);
+          heartbeatMissCount = 0;
+        }
+      } else if (sinceBeat <= 3000) {
+        heartbeatMissCount = 0;
       }
     } catch { /* 忽略轮询错误 */ }
   }, 1000);
@@ -997,7 +1028,6 @@ export function deactivate(ctx) {
   hideWindow(ctx);
   ctx.windows.close(WINDOW_ID);
   if (windowRecoveryTimer) { clearInterval(windowRecoveryTimer); windowRecoveryTimer = null; }
-  ctx.storage.set("__taskbar_lyric_heartbeat", null).catch(() => {});
   channel?.close();
   channel = null;
   settingsDispose?.();
