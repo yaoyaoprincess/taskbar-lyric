@@ -329,6 +329,50 @@ export function activateWindow(ctx) {
       let settingsSyncTimer = null;    // storage 轮询定时器(BroadcastChannel 后备)
       let lastSettingsHash = "";       // 上次轮询到的设置 hash,避免重复更新
 
+      // ============ 逐字高亮 DOM 驱动 ============
+      let currentActiveLineIndex = -1;
+      let currentActiveCharEls = [];   // 逐字歌词字符元素数组
+      let currentActiveWholeSpan = null; // 非逐字歌词整体 span
+
+      const resetCharEls = () => {
+        currentActiveCharEls = [];
+        currentActiveWholeSpan = null;
+      };
+
+      // 更新逐字 / 整句进度的核心函数
+      const updateKaraokeProgress = (seekMs) => {
+        const line = currentLine.value;
+        if (!line) return;
+        if (isYrcLine(line)) {
+          const chars = line.characters;
+          for (let i = 0; i < currentActiveCharEls.length; i++) {
+            const el = currentActiveCharEls[i];
+            if (!el) continue;
+            const char = chars[i];
+            if (!char) continue;
+            const duration = Math.max((char.endTime || 0) - (char.startTime || 0), 0.001);
+            const progress = Math.max(Math.min((seekMs - (char.startTime || 0)) / duration, 1), 0);
+            el.style.backgroundPositionX = `${100 - progress * 100}%`;
+          }
+        } else {
+          if (currentActiveWholeSpan) {
+            const lineStart = getLineStartMs(line);
+            const chars = line.characters || [];
+            let lineEnd;
+            if (chars.length > 0) {
+              lineEnd = chars[chars.length - 1]?.endTime ?? 0;
+            } else {
+              const nextIdx = currentIndex.value + 1;
+              const lines = snapshot.value?.lyric?.lines ?? [];
+              lineEnd = nextIdx < lines.length ? getLineStartMs(lines[nextIdx]) : lineStart + 5000;
+            }
+            const duration = Math.max(lineEnd - lineStart, 1);
+            const progress = Math.max(0, Math.min(1, (seekMs - lineStart) / duration));
+            currentActiveWholeSpan.style.backgroundPositionX = `${100 - progress * 100}%`;
+          }
+        }
+      };
+
       /**
        * 设置 BroadcastChannel 监听
        * 接收来自主插件(index.js)的设置同步。
@@ -354,12 +398,15 @@ export function activateWindow(ctx) {
         const snap = snapshot.value;
         if (!snap) return;
         const lines = snap.lyric?.lines ?? [];
-        const seekMs = getLyricSeekMs(snap) + LYRIC_LOOKAHEAD_MS;
-        const idx = calculateLineIndex(lines, seekMs);
+        const progressSeekMs = getLyricSeekMs(snap);               // 不带超前，用于进度
+        const indexSeekMs = progressSeekMs + LYRIC_LOOKAHEAD_MS;   // 带超前，用于切换行
+        const idx = calculateLineIndex(lines, indexSeekMs);
         const rawIndex = idx >= 0 ? idx : (snap.lyric?.currentIndex ?? -1);
         // 应用正则过滤，跳过匹配的歌词行（制作信息、版权信息等）
         currentIndex.value = findNextVisibleIndex(rawIndex, lines, settings);
         // 每帧驱动滚动位置,取代 CSS animation
+        updateKaraokeProgress(progressSeekMs);
+        // 驱动滚动位置
         updateScrollPosition();
       };
 
@@ -663,14 +710,24 @@ export function activateWindow(ctx) {
 
       /**
        * 渲染卡拉OK 效果的歌词文本
-       * 对于非 YRC 歌词,使用整体渐变效果
+       * 统一使用 50% 渐变 + backgroundPositionX，进度由 updateKaraokeProgress 直接驱动
        */
       const renderKaraokeText = (text, line, seekMs, isActive) => {
         if (!isActive || !line) return text;
 
+        const playedColor = settings.playedColor;
+        const unplayedColor = settings.unplayedColor;
+        const bgImage = `linear-gradient(to right, ${playedColor} 50%, ${unplayedColor} 50%)`;
+
         // 逐字歌词(YRC 格式)
         if (isYrcLine(line)) {
           const chars = line.characters || [];
+          // 行变化时重建元素数组，避免引用旧元素
+          if (currentActiveLineIndex !== currentIndex.value) {
+            currentActiveLineIndex = currentIndex.value;
+            currentActiveCharEls = new Array(chars.length).fill(null);
+            currentActiveWholeSpan = null;
+          }
           return chars.map((char, i) => {
             const duration = Math.max((char.endTime || 0) - (char.startTime || 0), 0.001);
             const progress = Math.max(Math.min((seekMs - (char.startTime || 0)) / duration, 1), 0);
@@ -678,14 +735,24 @@ export function activateWindow(ctx) {
               key: i,
               class: "tb-lyric-char",
               style: {
-                backgroundImage: `linear-gradient(to right, ${settings.playedColor} 50%, ${settings.unplayedColor} 50%)`,
+                backgroundImage: bgImage,
                 backgroundPositionX: `${100 - progress * 100}%`,
+              },
+              ref: (el) => {
+                if (el) {
+                  currentActiveCharEls[i] = el;
+                }
               },
             }, char.text || "");
           });
         }
 
-        // 非逐字歌词:整体渐变
+        // 非逐字歌词: 整体渐变
+        if (currentActiveLineIndex !== currentIndex.value) {
+          currentActiveLineIndex = currentIndex.value;
+          currentActiveCharEls = [];
+          currentActiveWholeSpan = null;
+        }
         const lineStart = getLineStartMs(line);
         const chars = line.characters || [];
         let lineEnd;
@@ -702,8 +769,10 @@ export function activateWindow(ctx) {
         return h("span", {
           class: "tb-lyric-char",
           style: {
-            backgroundImage: `linear-gradient(to right, ${settings.playedColor} ${progress * 100}%, ${settings.unplayedColor} ${progress * 100}%)`,
+            backgroundImage: bgImage,
+            backgroundPositionX: `${100 - progress * 100}%`,
           },
+          ref: (el) => { currentActiveWholeSpan = el; },
         }, text);
       };
 
@@ -737,7 +806,7 @@ export function activateWindow(ctx) {
         // 6. 启动 storage 轮询(BroadcastChannel 后备方案 - 当跨进程 channel 不可用时,
         //    通过轮询 storage 来检测主插件的设置变更,确保浮窗始终同步最新配置)
         settingsSyncTimer = setInterval(async () => {
-          if (receivedFromChannel) return; // channel 可用时退出轮询
+          if (receivedFromChannel) return;
           try {
             const saved = await ctx.storage.get("settings");
             if (!saved || typeof saved !== "object") return;
